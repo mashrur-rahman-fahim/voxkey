@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+Global push-to-talk STT daemon using Groq Whisper.
+Hold F8 to record, release to transcribe and type at cursor.
+"""
+
+import os
+import sys
+import signal
+import subprocess
+import tempfile
+import threading
+import fcntl
+import atexit
+
+PIDFILE = "/tmp/stt-daemon.pid"
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+MODEL = "whisper-large-v3-turbo"
+F8_CODE = 66
+
+AUDIO_DEVICE = "plughw:1,0"
+AUDIO_FORMAT = "S16_LE"
+AUDIO_RATE = 48000
+AUDIO_CHANNELS = 1
+
+REAL_USER = os.environ.get("SUDO_USER", os.environ.get("USER", "mashrurrahman"))
+REAL_UID = os.environ.get("SUDO_UID", str(os.getuid()))
+REAL_HOME = os.path.expanduser(f"~{REAL_USER}")
+
+USER_SITE = f"{REAL_HOME}/.local/lib/python3.12/site-packages"
+if USER_SITE not in sys.path:
+    sys.path.insert(0, USER_SITE)
+
+
+def notify(msg, title="STT"):
+    try:
+        env = os.environ.copy()
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{REAL_UID}")
+        subprocess.Popen(
+            ["sudo", "-u", REAL_USER, "--preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,DISPLAY,DBUS_SESSION_BUS_ADDRESS",
+             "notify-send", "-t", "2000", title, msg],
+            env=env, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def type_text(text):
+    try:
+        subprocess.run(
+            ["ydotool", "type", "--key-delay", "8", "--delay", "80", "--", text],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        print(f"  type error: {e}", file=sys.stderr, flush=True)
+
+
+def transcribe_and_type(audio_path):
+    try:
+        size = os.path.getsize(audio_path)
+        if size < 5000:
+            notify("No audio captured")
+            return
+
+        print(f"  ⚡ Transcribing ({size} bytes)...", flush=True)
+
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        with open(audio_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model=MODEL,
+                file=("audio.wav", f, "audio/wav"),
+                language="en",
+                prompt="Transcribe clearly. This is spoken English, possibly about programming, software, or general conversation.",
+                temperature=0.0,
+            )
+        text = result.text.strip()
+        if not text:
+            notify("No speech detected")
+            return
+
+        print(f"  → {text}", flush=True)
+        type_text(text)
+        notify(f"✓ {text[:80]}")
+
+    except Exception as e:
+        notify(f"Error: {e}")
+        print(f"  ✗ Error: {e}", file=sys.stderr, flush=True)
+    finally:
+        if os.path.exists(audio_path):
+            os.unlink(audio_path)
+
+
+def find_keyboards():
+    import evdev
+    keyboards = []
+    for path in evdev.list_devices():
+        dev = evdev.InputDevice(path)
+        if 'eyboard' in dev.name:
+            keyboards.append(dev)
+    return keyboards
+
+
+def acquire_lock():
+    """Ensure only one STT daemon runs at a time using a PID file lock."""
+    # Check if another instance is already running
+    if os.path.exists(PIDFILE):
+        try:
+            with open(PIDFILE, "r") as f:
+                old_pid = int(f.read().strip())
+            # Check if that process is still alive
+            os.kill(old_pid, 0)
+            print(f"✗ STT daemon already running (PID {old_pid})")
+            print(f"  Stop it first: sudo kill {old_pid}")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # Old process is dead, clean up stale pidfile
+            os.unlink(PIDFILE)
+        except PermissionError:
+            # Process exists but we can't signal it — it's alive
+            print(f"✗ STT daemon already running (PID {old_pid})")
+            print(f"  Stop it first: sudo kill {old_pid}")
+            sys.exit(1)
+
+    # Write our PID
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def cleanup():
+        try:
+            os.unlink(PIDFILE)
+        except Exception:
+            pass
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(0)))
+
+
+def main():
+    import evdev
+    import selectors
+
+    acquire_lock()
+
+    keyboards = find_keyboards()
+    if not keyboards:
+        print("No keyboards found!")
+        sys.exit(1)
+
+    print(f"🎙  STT daemon running — hold F8 to record, release to type")
+    print(f"   Keyboards: {', '.join(k.name for k in keyboards)}")
+    print(f"   Ctrl+C to quit\n")
+
+    recording = False
+    rec_proc = None
+    audio_path = None
+
+    sel = selectors.DefaultSelector()
+    for kb in keyboards:
+        sel.register(kb, selectors.EVENT_READ)
+
+    try:
+        while True:
+            for key, _ in sel.select():
+                dev = key.fileobj
+                for event in dev.read():
+                    if event.type != evdev.ecodes.EV_KEY:
+                        continue
+                    ke = evdev.categorize(event)
+                    if ke.scancode != F8_CODE:
+                        continue
+
+                    if ke.keystate == ke.key_down and not recording:
+                        recording = True
+                        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                        audio_path = tmp.name
+                        tmp.close()
+                        rec_proc = subprocess.Popen(
+                            ["arecord", "-D", AUDIO_DEVICE, "-f", AUDIO_FORMAT,
+                             "-r", str(AUDIO_RATE), "-c", str(AUDIO_CHANNELS),
+                             "-q", audio_path],
+                            stderr=subprocess.DEVNULL,
+                        )
+                        print("  🔴 Recording...", flush=True)
+
+                    elif ke.keystate == ke.key_up and recording:
+                        recording = False
+                        if rec_proc:
+                            rec_proc.send_signal(signal.SIGINT)
+                            rec_proc.wait()
+                            rec_proc = None
+                        print("  ⏹ Transcribing...", flush=True)
+                        threading.Thread(
+                            target=transcribe_and_type,
+                            args=(audio_path,),
+                            daemon=True,
+                        ).start()
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        if rec_proc:
+            rec_proc.kill()
+
+
+if __name__ == "__main__":
+    main()
