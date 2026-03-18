@@ -183,6 +183,7 @@ def main():
                             stderr=subprocess.DEVNULL,
                         )
                         print("  🔴 Recording...", flush=True)
+                        notify("🎙 Recording...")
 
                     elif ke.keystate == ke.key_up and recording:
                         recording = False
